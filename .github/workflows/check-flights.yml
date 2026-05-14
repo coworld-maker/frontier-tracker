@@ -2,7 +2,7 @@ name: Check Go Wild Flights
 
 on:
   schedule:
-    # Runs every 4 hours — Go Wild seats often drop in the morning
+    # Every 4 hours — Go Wild seats often drop in the morning
     - cron: "0 */4 * * *"
   workflow_dispatch: # allow manual runs from the Actions tab
 
@@ -10,44 +10,34 @@ jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # needed to commit the updated state file
+      contents: write # needed to commit updated state file
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Use a PAT so the push back triggers other workflows if needed
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
-          cache: "npm"
+          python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
-        run: npm ci
+        run: pip install -r requirements.txt
 
       - name: Install Playwright browsers
-        run: npx playwright install chromium --with-deps
+        run: playwright install chromium --with-deps
 
       - name: Write config from secret
-        # Store your full config.json content as a repo secret named CONFIG_JSON
         run: echo '${{ secrets.CONFIG_JSON }}' > config.json
 
-      - name: Build
-        run: npm run build
-
       - name: Run tracker
-        run: npm run check
-        env:
-          NODE_ENV: production
+        run: python main.py
 
       - name: Commit updated state
         run: |
           git config user.name "go-wild-bot"
           git config user.email "actions@github.com"
           git add data/seen-flights.json
-          # Only commit if there are actual changes
           git diff --cached --quiet || git commit -m "chore: update seen-flights state [skip ci]"
           git push
