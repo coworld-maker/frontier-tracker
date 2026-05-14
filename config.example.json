@@ -1,0 +1,43 @@
+{
+  "timezone": "America/Chicago",
+  "routes": [
+    {
+      "comment": "Denver to Las Vegas, any Go Wild seat in the next 14 days",
+      "origin": "DEN",
+      "destination": "LAS",
+      "dates": "flexible"
+    },
+    {
+      "comment": "Chicago Midway to Miami, specific dates only",
+      "origin": "MDW",
+      "destination": "MIA",
+      "dates": ["2024-08-10", "2024-08-11", "2024-08-12"],
+      "maxPrice": 20
+    }
+  ],
+  "notifications": {
+    "email": {
+      "enabled": false,
+      "smtp": {
+        "host": "smtp.gmail.com",
+        "port": 587,
+        "user": "you@gmail.com",
+        "pass": "your-gmail-app-password"
+      },
+      "to": "you@gmail.com"
+    },
+    "pushover": {
+      "enabled": false,
+      "userKey": "your-pushover-user-key",
+      "apiToken": "your-pushover-app-token"
+    },
+    "slack": {
+      "enabled": false,
+      "webhookUrl": "https://hooks.slack.com/services/T.../B.../..."
+    },
+    "discord": {
+      "enabled": false,
+      "webhookUrl": "https://discord.com/api/webhooks/..."
+    }
+  }
+}

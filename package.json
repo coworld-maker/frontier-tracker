@@ -1,0 +1,20 @@
+{
+  "name": "frontier-go-wild-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "check": "node dist/index.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.14",
+    "playwright": "^1.44.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/nodemailer": "^6.4.15",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
