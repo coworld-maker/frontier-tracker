@@ -1,4 +1,5 @@
 import smtplib
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -99,18 +100,19 @@ def _send_slack(title: str, flights: list[GoWildFlight], cfg: dict) -> None:
 
 
 def _send_discord(title: str, flights: list[GoWildFlight], cfg: dict) -> None:
-    embeds = [
-        {
-            "title": f"✈ {title}",
+    for f in flights:
+        price_str = f"${f.price:.0f}" if f.price > 0 else "$0 (taxes only)"
+        embed = {
+            "title": f"✈ Go Wild Seat Available",
             "color": 0x00A651,
-            "description": _flight_list_text(flights),
+            "description": f"• {f.origin} → {f.destination} | {f.date} {f.departure_time} | Flight {f.flight_number} | {price_str}",
             "url": "https://www.flyfrontier.com",
             "footer": {"text": "Book at flyfrontier.com"},
         }
-    ]
-    resp = requests.post(cfg["webhookUrl"], json={"embeds": embeds}, timeout=10)
-    resp.raise_for_status()
-    print("  Discord sent.")
+        resp = requests.post(cfg["webhookUrl"], json={"embeds": [embed]}, timeout=10)
+        resp.raise_for_status()
+        time.sleep(0.5)  # avoid Discord rate limiting
+    print(f"  Discord sent ({len(flights)} notification(s)).")
 
 
 def send_notifications(flights: list[GoWildFlight], config: dict) -> None:
