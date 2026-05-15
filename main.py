@@ -55,12 +55,12 @@ def main() -> None:
     config = load_config()
     state = load_state()
 
-    routes = config.get("routes", [])
     timezone_name = config.get("timezone", "America/Chicago")
-    print(f"Checking {len(routes)} route(s)…")
+    mode = "all Frontier routes" if config.get("all_routes") else f"{len(config.get('routes', []))} route(s)"
+    print(f"Mode: {mode}")
 
     try:
-        all_flights = scrape_go_wild_flights(routes, timezone_name)
+        all_flights = scrape_go_wild_flights(config, timezone_name)
     except Exception as e:
         print(f"Scraper error: {e}")
         sys.exit(1)

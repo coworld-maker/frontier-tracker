@@ -1,20 +1,12 @@
 {
   "timezone": "America/Chicago",
-  "routes": [
-    {
-      "comment": "Denver to Las Vegas, any Go Wild seat in the next 14 days",
-      "origin": "DEN",
-      "destination": "LAS",
-      "dates": "flexible"
-    },
-    {
-      "comment": "Chicago Midway to Miami, specific dates only",
-      "origin": "MDW",
-      "destination": "MIA",
-      "dates": ["2024-08-10", "2024-08-11", "2024-08-12"],
-      "maxPrice": 20
-    }
-  ],
+
+  "all_routes": true,
+  "days_ahead": 7,
+  "maxPrice": 20,
+
+  "routes": [],
+
   "notifications": {
     "email": {
       "enabled": false,
