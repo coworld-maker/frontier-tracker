@@ -1,15 +1,17 @@
+import asyncio
 import re
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import sync_playwright, Page, Response, Browser
+from playwright.async_api import async_playwright, Page, Response, Browser
 
-FRONTIER_SEARCH = "https://www.flyfrontier.com/travel/book-a-flight/"
+CONCURRENCY = 8          # parallel browser contexts
+ROUTE_TIMEOUT_MS = 20_000  # 20s per route before giving up
 GO_WILD_BRANDS = {"go wild", "gowild", "wild"}
+FRONTIER_SEARCH = "https://www.flyfrontier.com/travel/book-a-flight/"
 
 # All airports Frontier serves as of 2025
 FRONTIER_AIRPORTS = [
@@ -24,13 +26,10 @@ FRONTIER_AIRPORTS = [
 
 STEALTH_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"macOS"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
 }
 
 USER_AGENT = (
@@ -55,9 +54,17 @@ class GoWildFlight:
         return f"{self.origin}-{self.destination}-{self.date}-{self.flight_number}"
 
     def label(self) -> str:
-        price_str = "FREE (taxes only)" if self.price == 0 else f"${self.price:.0f} {self.currency}"
-        return f"{self.origin} → {self.destination}  |  {self.date} {self.departure_time}  |  Flight {self.flight_number}  |  {price_str}"
+        price_str = f"${self.price:.0f}" if self.price > 0 else "$0 (taxes only)"
+        return (
+            f"{self.origin} → {self.destination} | "
+            f"{self.date} {self.departure_time} | "
+            f"Flight {self.flight_number} | {price_str}"
+        )
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _date_range(days: int, timezone: str) -> list[str]:
     tz = ZoneInfo(timezone)
@@ -65,128 +72,10 @@ def _date_range(days: int, timezone: str) -> list[str]:
     return [(today + timedelta(days=i)).isoformat() for i in range(1, days + 1)]
 
 
-def _flight_is_go_wild(brand: str) -> bool:
-    brand_lower = brand.lower()
-    return any(b in brand_lower for b in GO_WILD_BRANDS)
+def _is_go_wild(brand: str) -> bool:
+    b = brand.lower()
+    return any(w in b for w in GO_WILD_BRANDS)
 
-
-def _new_context(browser: Browser):
-    return browser.new_context(
-        user_agent=USER_AGENT,
-        extra_http_headers=STEALTH_HEADERS,
-        viewport={"width": 1280, "height": 800},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Route discovery
-# ---------------------------------------------------------------------------
-
-def discover_routes(browser: Browser) -> list[tuple[str, str]]:
-    """
-    Visit Frontier's search page for each origin airport and intercept the
-    API response that lists available destinations. Returns all valid (origin,
-    destination) pairs Frontier actually flies.
-    """
-    print("Discovering all Frontier routes…")
-    route_pairs: set[tuple[str, str]] = set()
-
-    for origin in FRONTIER_AIRPORTS:
-        context = _new_context(browser)
-        page = context.new_page()
-        found: list[str] = []
-
-        def on_response(response: Response, _origin: str = origin) -> None:
-            if response.status != 200:
-                return
-            ct = response.headers.get("content-type", "")
-            if "application/json" not in ct:
-                return
-            url = response.url
-            # Frontier's destinations/airports API
-            if not any(kw in url for kw in ("destination", "airport", "route", "station")):
-                return
-            if not ("flyfrontier" in url or "frontierairlines" in url):
-                return
-            try:
-                data = response.json()
-                _collect_airport_codes(data, found)
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        try:
-            # Navigating with an origin pre-selected triggers the destinations call
-            url = (
-                f"{FRONTIER_SEARCH}?"
-                + urlencode({"origin": origin, "tripType": "ONE_WAY"})
-            )
-            page.goto(url, wait_until="networkidle", timeout=30_000)
-            page.wait_for_timeout(2_000)
-
-            # Also try clicking the destination field to trigger lazy-loaded data
-            try:
-                dest_field = page.locator(
-                    'input[placeholder*="destination" i], input[placeholder*="to" i], '
-                    '[data-testid*="destination"] input'
-                ).first
-                if dest_field.is_visible(timeout=2_000):
-                    dest_field.click()
-                    page.wait_for_timeout(1_500)
-            except Exception:
-                pass
-
-        except Exception as e:
-            print(f"  Warning: could not load destinations for {origin}: {e}")
-        finally:
-            context.close()
-
-        for dest in found:
-            if dest != origin and dest in FRONTIER_AIRPORTS:
-                route_pairs.add((origin, dest))
-
-        print(f"  {origin}: {len(found)} destination(s) found")
-        time.sleep(1.5)
-
-    # If the API discovery yielded nothing (site structure changed), fall back
-    # to generating all combinations from the known airport list
-    if not route_pairs:
-        print("  API discovery found no routes — falling back to full airport matrix")
-        for i, orig in enumerate(FRONTIER_AIRPORTS):
-            for dest in FRONTIER_AIRPORTS[i + 1 :]:
-                route_pairs.add((orig, dest))
-                route_pairs.add((dest, orig))
-
-    pairs = sorted(route_pairs)
-    print(f"Total route pairs to check: {len(pairs)}")
-    return pairs
-
-
-def _collect_airport_codes(node: Any, out: list[str]) -> None:
-    """Recursively walk JSON and collect IATA airport codes."""
-    if isinstance(node, list):
-        for item in node:
-            _collect_airport_codes(item, out)
-    elif isinstance(node, dict):
-        for key, val in node.items():
-            # Common field names for airport/station codes
-            if key.lower() in ("code", "iata", "airportcode", "stationcode", "id") and isinstance(val, str):
-                candidate = val.strip().upper()
-                if len(candidate) == 3 and candidate.isalpha():
-                    out.append(candidate)
-            else:
-                _collect_airport_codes(val, out)
-    elif isinstance(node, str):
-        # Bare 3-letter strings in arrays
-        candidate = node.strip().upper()
-        if len(candidate) == 3 and candidate.isalpha():
-            out.append(candidate)
-
-
-# ---------------------------------------------------------------------------
-# Flight availability checking
-# ---------------------------------------------------------------------------
 
 def _extract_go_wild_flights(data: Any, route: dict, date: str) -> list[GoWildFlight]:
     flights: list[GoWildFlight] = []
@@ -199,45 +88,39 @@ def _extract_go_wild_flights(data: Any, route: dict, date: str) -> list[GoWildFl
             return
         if not isinstance(node, dict):
             return
-
         has_price = any(k in node for k in ("price", "totalPrice", "amount", "fare"))
-        has_flight = any(k in node for k in ("flightNumber", "flight_number", "segments", "legs"))
-        has_brand = any(k in node for k in ("fareBrand", "fare_brand", "brandName", "fareFamily", "productName"))
-
-        if has_price and (has_flight or has_brand):
-            brand_raw = str(
-                node.get("fareBrand") or node.get("fare_brand") or node.get("brandName")
-                or node.get("fareFamily") or node.get("productName") or ""
+        has_context = any(k in node for k in (
+            "flightNumber", "flight_number", "segments", "legs",
+            "fareBrand", "fare_brand", "brandName", "fareFamily", "productName",
+        ))
+        if has_price and has_context:
+            brand = str(
+                node.get("fareBrand") or node.get("fare_brand") or
+                node.get("brandName") or node.get("fareFamily") or
+                node.get("productName") or ""
             )
-            if _flight_is_go_wild(brand_raw):
+            if _is_go_wild(brand):
                 price = float(
-                    node.get("price") or node.get("totalPrice")
-                    or node.get("amount") or node.get("fare") or 0
+                    node.get("price") or node.get("totalPrice") or
+                    node.get("amount") or node.get("fare") or 0
                 )
                 if max_price is None or price <= max_price:
-                    fn = str(
-                        node.get("flightNumber") or node.get("flight_number")
-                        or node.get("flightNo") or node.get("number") or "UNK"
-                    )
-                    dep = str(
-                        node.get("departureTime") or node.get("departure_time")
-                        or node.get("departureDatetime") or node.get("departureDateTime")
-                        or node.get("departs") or ""
-                    )
-                    currency = str(node.get("currency") or node.get("currencyCode") or "USD")
-                    fare_class = brand_raw or "Go Wild"
-                    flights.append(
-                        GoWildFlight(
-                            origin=route["origin"],
-                            destination=route["destination"],
-                            date=date,
-                            departure_time=dep,
-                            flight_number=fn,
-                            price=price,
-                            currency=currency,
-                            fare_class=fare_class,
-                        )
-                    )
+                    flights.append(GoWildFlight(
+                        origin=route["origin"],
+                        destination=route["destination"],
+                        date=date,
+                        departure_time=str(
+                            node.get("departureTime") or node.get("departure_time") or
+                            node.get("departureDatetime") or node.get("departs") or ""
+                        ),
+                        flight_number=str(
+                            node.get("flightNumber") or node.get("flight_number") or
+                            node.get("flightNo") or node.get("number") or "UNK"
+                        ),
+                        price=price,
+                        currency=str(node.get("currency") or node.get("currencyCode") or "USD"),
+                        fare_class=brand or "Go Wild",
+                    ))
         for v in node.values():
             walk(v)
 
@@ -245,144 +128,228 @@ def _extract_go_wild_flights(data: Any, route: dict, date: str) -> list[GoWildFl
     return flights
 
 
-def _dom_fallback(page: Page, route: dict, date: str) -> list[GoWildFlight]:
-    flights: list[GoWildFlight] = []
-    max_price = route.get("maxPrice")
-    try:
-        cards = page.locator('[data-testid*="flight"], .flight-card, .fare-cell').all()
-        for card in cards:
-            text = card.text_content() or ""
-            lower = text.lower()
-            if not any(b in lower for b in GO_WILD_BRANDS):
-                continue
-            price_match = re.search(r"\$(\d+(?:\.\d+)?)", text)
-            price = float(price_match.group(1)) if price_match else 0.0
-            if max_price is not None and price > max_price:
-                continue
-            fn_match = re.search(r"F9\s*(\d+)", text, re.IGNORECASE)
-            flight_number = f"F9{fn_match.group(1)}" if fn_match else "UNK"
-            time_match = re.search(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, re.IGNORECASE)
-            departure_time = time_match.group(0) if time_match else ""
-            if flight_number != "UNK" or departure_time:
-                flights.append(
-                    GoWildFlight(
-                        origin=route["origin"],
-                        destination=route["destination"],
-                        date=date,
-                        departure_time=departure_time,
-                        flight_number=flight_number,
-                        price=price,
-                        currency="USD",
-                        fare_class="Go Wild",
-                    )
-                )
-    except Exception:
-        pass
-    return flights
+def _collect_airport_codes(node: Any, out: list[str]) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _collect_airport_codes(item, out)
+    elif isinstance(node, dict):
+        for key, val in node.items():
+            if key.lower() in ("code", "iata", "airportcode", "stationcode", "id") and isinstance(val, str):
+                c = val.strip().upper()
+                if len(c) == 3 and c.isalpha():
+                    out.append(c)
+            else:
+                _collect_airport_codes(val, out)
+    elif isinstance(node, str):
+        c = node.strip().upper()
+        if len(c) == 3 and c.isalpha():
+            out.append(c)
 
 
-def _check_route(browser: Browser, route: dict, date: str) -> list[GoWildFlight]:
-    context = _new_context(browser)
-    page = context.new_page()
-    captured: list[GoWildFlight] = []
-    seen_keys: set[str] = set()
+async def _new_context(browser: Browser):
+    return await browser.new_context(
+        user_agent=USER_AGENT,
+        extra_http_headers=STEALTH_HEADERS,
+        viewport={"width": 1280, "height": 800},
+    )
 
-    def on_response(response: Response) -> None:
-        if response.status != 200:
-            return
-        ct = response.headers.get("content-type", "")
-        if "application/json" not in ct:
-            return
-        url = response.url
-        if not (
-            ("flyfrontier" in url or "frontierairlines" in url)
-            and "/api/" in url
-            and any(kw in url for kw in ("flight", "avail", "search", "offer"))
-        ):
-            return
+
+# ---------------------------------------------------------------------------
+# Route discovery (parallel)
+# ---------------------------------------------------------------------------
+
+async def _discover_origin(sem: asyncio.Semaphore, browser: Browser, origin: str) -> list[str]:
+    async with sem:
+        context = await _new_context(browser)
+        page = await context.new_page()
+        pending: list[Response] = []
+
+        def on_response(r: Response) -> None:
+            ct = r.headers.get("content-type", "")
+            if r.status == 200 and "application/json" in ct:
+                url = r.url
+                if any(kw in url for kw in ("destination", "airport", "route", "station")):
+                    if "flyfrontier" in url or "frontierairlines" in url:
+                        pending.append(r)
+
+        page.on("response", on_response)
+        found: list[str] = []
         try:
-            data = response.json()
-            for f in _extract_go_wild_flights(data, route, date):
-                if f.key() not in seen_keys:
-                    seen_keys.add(f.key())
-                    captured.append(f)
+            url = FRONTIER_SEARCH + "?" + urlencode({"origin": origin, "tripType": "ONE_WAY"})
+            await page.goto(url, wait_until="networkidle", timeout=30_000)
+            await page.wait_for_timeout(1_500)
+            for r in pending:
+                try:
+                    data = await r.json()
+                    _collect_airport_codes(data, found)
+                except Exception:
+                    pass
         except Exception:
             pass
+        finally:
+            await context.close()
+        return [d for d in found if d != origin and d in FRONTIER_AIRPORTS]
 
-    page.on("response", on_response)
 
-    try:
-        params = urlencode({
-            "origin": route["origin"],
-            "destination": route["destination"],
-            "departDate": date,
-            "returnDate": "",
-            "adults": "1",
-            "children": "0",
-            "infants": "0",
-            "tripType": "ONE_WAY",
-        })
-        page.goto(f"{FRONTIER_SEARCH}?{params}", wait_until="networkidle", timeout=45_000)
-        page.wait_for_timeout(3_000)
-        for f in _dom_fallback(page, route, date):
-            if f.key() not in seen_keys:
-                seen_keys.add(f.key())
-                captured.append(f)
-    except Exception as e:
-        print(f"    Warning: {route['origin']}→{route['destination']} {date}: {e}")
-    finally:
-        context.close()
+async def _discover_routes_async(browser: Browser) -> list[tuple[str, str]]:
+    print("Discovering Frontier routes (parallel)…")
+    sem = asyncio.Semaphore(CONCURRENCY)
+    tasks = [_discover_origin(sem, browser, o) for o in FRONTIER_AIRPORTS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    return captured
+    pairs: set[tuple[str, str]] = set()
+    for origin, result in zip(FRONTIER_AIRPORTS, results):
+        if isinstance(result, list):
+            for dest in result:
+                pairs.add((origin, dest))
+
+    if not pairs:
+        print("  API discovery yielded nothing — using full airport matrix")
+        for i, o in enumerate(FRONTIER_AIRPORTS):
+            for d in FRONTIER_AIRPORTS[i + 1:]:
+                pairs.add((o, d))
+                pairs.add((d, o))
+
+    print(f"  {len(pairs)} route pairs to check")
+    return sorted(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Route checking (parallel)
+# ---------------------------------------------------------------------------
+
+async def _check_route(
+    sem: asyncio.Semaphore,
+    browser: Browser,
+    route: dict,
+    date: str,
+) -> list[GoWildFlight]:
+    async with sem:
+        context = await _new_context(browser)
+        page = await context.new_page()
+        pending: list[Response] = []
+
+        def on_response(r: Response) -> None:
+            ct = r.headers.get("content-type", "")
+            if r.status != 200 or "application/json" not in ct:
+                return
+            url = r.url
+            if (
+                ("flyfrontier" in url or "frontierairlines" in url)
+                and "/api/" in url
+                and any(kw in url for kw in ("flight", "avail", "search", "offer"))
+            ):
+                pending.append(r)
+
+        page.on("response", on_response)
+        captured: list[GoWildFlight] = []
+        seen: set[str] = set()
+
+        try:
+            params = urlencode({
+                "origin": route["origin"], "destination": route["destination"],
+                "departDate": date, "returnDate": "",
+                "adults": "1", "children": "0", "infants": "0",
+                "tripType": "ONE_WAY",
+            })
+            await page.goto(
+                f"{FRONTIER_SEARCH}?{params}",
+                wait_until="networkidle",
+                timeout=ROUTE_TIMEOUT_MS,
+            )
+            await page.wait_for_timeout(2_000)
+
+            for r in pending:
+                try:
+                    data = await r.json()
+                    for f in _extract_go_wild_flights(data, route, date):
+                        if f.key() not in seen:
+                            seen.add(f.key())
+                            captured.append(f)
+                except Exception:
+                    pass
+
+            # DOM fallback
+            try:
+                cards = await page.locator('[data-testid*="flight"], .flight-card, .fare-cell').all()
+                for card in cards:
+                    text = await card.text_content() or ""
+                    if not any(b in text.lower() for b in GO_WILD_BRANDS):
+                        continue
+                    pm = re.search(r"\$(\d+(?:\.\d+)?)", text)
+                    price = float(pm.group(1)) if pm else 0.0
+                    mp = route.get("maxPrice")
+                    if mp is not None and price > mp:
+                        continue
+                    fn_m = re.search(r"F9\s*(\d+)", text, re.IGNORECASE)
+                    fn = f"F9{fn_m.group(1)}" if fn_m else "UNK"
+                    tm = re.search(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, re.IGNORECASE)
+                    dep = tm.group(0) if tm else ""
+                    if fn != "UNK" or dep:
+                        f = GoWildFlight(route["origin"], route["destination"], date, dep, fn, price, "USD", "Go Wild")
+                        if f.key() not in seen:
+                            seen.add(f.key())
+                            captured.append(f)
+            except Exception:
+                pass
+
+        except Exception as e:
+            o, d = route["origin"], route["destination"]
+            print(f"    Timeout/error {o}→{d} {date}: {type(e).__name__}")
+        finally:
+            await context.close()
+
+        return captured
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def scrape_go_wild_flights(
-    config: dict,
-    timezone: str = "America/Chicago",
-) -> list[GoWildFlight]:
-    """
-    Main entry point. Reads `all_routes` and `routes` from config.
-    If all_routes is true, discovers every Frontier route automatically.
-    """
+async def _run(config: dict, timezone: str) -> list[GoWildFlight]:
     all_routes_mode = config.get("all_routes", False)
-    days_ahead = config.get("days_ahead", 7 if all_routes_mode else 14)
-    manual_routes = config.get("routes", [])
+    days_ahead = config.get("days_ahead", 3 if all_routes_mode else 14)
+    dates = _date_range(days_ahead, timezone)
 
-    results: list[GoWildFlight] = []
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
         try:
             if all_routes_mode:
-                pairs = discover_routes(browser)
-                # Wrap into route dicts so _check_route can use them
+                pairs = await _discover_routes_async(browser)
                 routes_to_check = [
                     {"origin": o, "destination": d, "maxPrice": config.get("maxPrice")}
                     for o, d in pairs
                 ]
             else:
-                routes_to_check = manual_routes
-
-            dates = _date_range(days_ahead, timezone)
+                routes_to_check = config.get("routes", [])
 
             total = len(routes_to_check) * len(dates)
-            print(f"Checking {len(routes_to_check)} route(s) × {len(dates)} date(s) = {total} searches")
+            print(f"Checking {len(routes_to_check)} route(s) × {len(dates)} date(s) = {total} searches ({CONCURRENCY} parallel)")
 
-            for i, route in enumerate(routes_to_check):
-                route_dates = (
-                    dates
-                    if all_routes_mode or route.get("dates") == "flexible"
+            sem = asyncio.Semaphore(CONCURRENCY)
+            tasks = [
+                _check_route(sem, browser, route, date)
+                for route in routes_to_check
+                for date in (
+                    dates if all_routes_mode or route.get("dates") == "flexible"
                     else route.get("dates", dates)
                 )
-                for date in route_dates:
-                    print(f"  [{i+1}/{len(routes_to_check)}] {route['origin']} → {route['destination']} {date}…")
-                    results.extend(_check_route(browser, route, date))
-                    time.sleep(2.0)
-        finally:
-            browser.close()
+            ]
 
-    return results
+            all_results: list[GoWildFlight] = []
+            done = 0
+            for coro in asyncio.as_completed(tasks):
+                flights = await coro
+                all_results.extend(flights)
+                done += 1
+                if done % 50 == 0:
+                    print(f"  Progress: {done}/{len(tasks)} searches complete, {len(all_results)} Go Wild flight(s) found so far")
+
+        finally:
+            await browser.close()
+
+    return all_results
+
+
+def scrape_go_wild_flights(config: dict, timezone: str = "America/Chicago") -> list[GoWildFlight]:
+    return asyncio.run(_run(config, timezone))
