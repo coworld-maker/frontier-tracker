@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 from playwright.async_api import async_playwright, Page, Response, Browser
 
-CONCURRENCY = 8          # parallel browser contexts
-ROUTE_TIMEOUT_MS = 20_000  # 20s per route before giving up
+CONCURRENCY = 16         # parallel browser contexts
+ROUTE_TIMEOUT_MS = 15_000  # 15s per route before giving up
 GO_WILD_BRANDS = {"go wild", "gowild", "wild"}
 FRONTIER_SEARCH = "https://www.flyfrontier.com/travel/book-a-flight/"
 
@@ -23,6 +23,79 @@ FRONTIER_AIRPORTS = [
     "RSW", "SAN", "SAT", "SDF", "SEA", "SFO", "SJC", "SJU", "SLC", "SMF",
     "STL", "SYR", "TPA", "TUL", "TUS", "TYS",
 ]
+
+# Hardcoded Frontier route pairs (both directions) used when live discovery fails.
+# Covers DEN hub-and-spoke + major point-to-point markets (~380 directional pairs).
+_HUB_SPOKES = [
+    # DEN is Frontier's main hub — connects to nearly every served city
+    ("DEN", "ABQ"), ("DEN", "ATL"), ("DEN", "AUS"), ("DEN", "BNA"), ("DEN", "BOS"),
+    ("DEN", "BUF"), ("DEN", "BWI"), ("DEN", "CHS"), ("DEN", "CLE"), ("DEN", "CLT"),
+    ("DEN", "CMH"), ("DEN", "CVG"), ("DEN", "DAL"), ("DEN", "DCA"), ("DEN", "DFW"),
+    ("DEN", "DTW"), ("DEN", "EWR"), ("DEN", "FLL"), ("DEN", "GRR"), ("DEN", "GSP"),
+    ("DEN", "HOU"), ("DEN", "IAD"), ("DEN", "IAH"), ("DEN", "IND"), ("DEN", "JAX"),
+    ("DEN", "LAS"), ("DEN", "LAX"), ("DEN", "LGA"), ("DEN", "MCI"), ("DEN", "MCO"),
+    ("DEN", "MDW"), ("DEN", "MEM"), ("DEN", "MHT"), ("DEN", "MIA"), ("DEN", "MKE"),
+    ("DEN", "MSP"), ("DEN", "MSY"), ("DEN", "OAK"), ("DEN", "OKC"), ("DEN", "OMA"),
+    ("DEN", "ORD"), ("DEN", "ORF"), ("DEN", "PHL"), ("DEN", "PHX"), ("DEN", "PIT"),
+    ("DEN", "PVD"), ("DEN", "RDU"), ("DEN", "RIC"), ("DEN", "ROC"), ("DEN", "RSW"),
+    ("DEN", "SAN"), ("DEN", "SAT"), ("DEN", "SDF"), ("DEN", "SEA"), ("DEN", "SFO"),
+    ("DEN", "SJC"), ("DEN", "SJU"), ("DEN", "SLC"), ("DEN", "SMF"), ("DEN", "STL"),
+    ("DEN", "SYR"), ("DEN", "TPA"), ("DEN", "TUL"), ("DEN", "TUS"), ("DEN", "TYS"),
+    # ATL point-to-point
+    ("ATL", "FLL"), ("ATL", "LAS"), ("ATL", "LAX"), ("ATL", "MCO"), ("ATL", "MDW"),
+    ("ATL", "MIA"), ("ATL", "PHX"), ("ATL", "SJU"), ("ATL", "TPA"), ("ATL", "BOS"),
+    ("ATL", "EWR"), ("ATL", "PHL"),
+    # Chicago MDW point-to-point
+    ("MDW", "FLL"), ("MDW", "LAS"), ("MDW", "MCO"), ("MDW", "MIA"), ("MDW", "PHX"),
+    ("MDW", "TPA"), ("MDW", "SJU"), ("MDW", "MSY"), ("MDW", "PHL"),
+    # LAS point-to-point
+    ("LAS", "ATL"), ("LAS", "CLT"), ("LAS", "FLL"), ("LAS", "IAH"), ("LAS", "LAX"),
+    ("LAS", "MCO"), ("LAS", "MIA"), ("LAS", "MSP"), ("LAS", "OAK"), ("LAS", "ORD"),
+    ("LAS", "PHX"), ("LAS", "SAN"), ("LAS", "SFO"), ("LAS", "SJC"), ("LAS", "TPA"),
+    # MCO point-to-point
+    ("MCO", "BOS"), ("MCO", "BWI"), ("MCO", "CLT"), ("MCO", "EWR"), ("MCO", "FLL"),
+    ("MCO", "IAD"), ("MCO", "LGA"), ("MCO", "MIA"), ("MCO", "PHL"), ("MCO", "PHX"),
+    ("MCO", "MSP"), ("MCO", "SJU"),
+    # PHX point-to-point
+    ("PHX", "LAX"), ("PHX", "OAK"), ("PHX", "SAN"), ("PHX", "SFO"), ("PHX", "SJC"),
+    ("PHX", "TPA"), ("PHX", "MSP"), ("PHX", "ORD"), ("PHX", "FLL"), ("PHX", "MIA"),
+    # FLL point-to-point
+    ("FLL", "BOS"), ("FLL", "BWI"), ("FLL", "CLE"), ("FLL", "CLT"), ("FLL", "EWR"),
+    ("FLL", "IAD"), ("FLL", "LGA"), ("FLL", "MDW"), ("FLL", "MIA"), ("FLL", "PHL"),
+    # MIA point-to-point
+    ("MIA", "BOS"), ("MIA", "EWR"), ("MIA", "LGA"), ("MIA", "MDW"), ("MIA", "ORD"),
+    ("MIA", "PHL"),
+    # SJU (San Juan) point-to-point
+    ("SJU", "BWI"), ("SJU", "CLT"), ("SJU", "EWR"), ("SJU", "FLL"), ("SJU", "IAD"),
+    ("SJU", "MIA"), ("SJU", "ORD"), ("SJU", "PHL"),
+    # West Coast / Southwest
+    ("LAX", "SFO"), ("LAX", "SJC"), ("LAX", "SEA"), ("LAX", "OAK"),
+    ("SFO", "SEA"), ("SAN", "SEA"), ("OAK", "SEA"),
+    # Texas point-to-point
+    ("DAL", "LAS"), ("DAL", "MCO"), ("DAL", "MIA"), ("DAL", "PHX"),
+    ("AUS", "LAS"), ("AUS", "MCO"), ("AUS", "PHX"),
+    ("SAT", "LAS"), ("SAT", "MCO"),
+    ("HOU", "LAS"), ("HOU", "MCO"), ("HOU", "MIA"),
+    # Southeast point-to-point
+    ("TPA", "BOS"), ("TPA", "BWI"), ("TPA", "CLT"), ("TPA", "EWR"),
+    ("TPA", "LGA"), ("TPA", "MDW"), ("TPA", "PHL"),
+    ("MSY", "LAS"), ("MSY", "MCO"), ("MSY", "PHX"),
+    # Midwest point-to-point
+    ("ORD", "FLL"), ("ORD", "LAS"), ("ORD", "MCO"), ("ORD", "MIA"), ("ORD", "PHX"),
+    ("MSP", "FLL"), ("MSP", "MCO"), ("MSP", "PHX"), ("MSP", "TPA"),
+    ("MCI", "LAS"), ("MCI", "MCO"), ("MCI", "PHX"),
+    # Mid-Atlantic / Northeast
+    ("PHL", "FLL"), ("PHL", "LAS"), ("PHL", "MCO"), ("PHL", "MIA"), ("PHL", "PHX"),
+    ("PHL", "TPA"), ("PHL", "SJU"),
+    ("EWR", "FLL"), ("EWR", "MCO"), ("EWR", "PHX"), ("EWR", "TPA"),
+    ("BOS", "FLL"), ("BOS", "MCO"), ("BOS", "MIA"), ("BOS", "TPA"),
+]
+
+# Expand both directions
+FRONTIER_KNOWN_ROUTES: set[tuple[str, str]] = set()
+for _o, _d in _HUB_SPOKES:
+    FRONTIER_KNOWN_ROUTES.add((_o, _d))
+    FRONTIER_KNOWN_ROUTES.add((_d, _o))
 
 STEALTH_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
@@ -204,11 +277,8 @@ async def _discover_routes_async(browser: Browser) -> list[tuple[str, str]]:
                 pairs.add((origin, dest))
 
     if not pairs:
-        print("  API discovery yielded nothing — using full airport matrix")
-        for i, o in enumerate(FRONTIER_AIRPORTS):
-            for d in FRONTIER_AIRPORTS[i + 1:]:
-                pairs.add((o, d))
-                pairs.add((d, o))
+        print("  API discovery yielded nothing — using hardcoded Frontier route list")
+        pairs = set(FRONTIER_KNOWN_ROUTES)
 
     print(f"  {len(pairs)} route pairs to check")
     return sorted(pairs)
