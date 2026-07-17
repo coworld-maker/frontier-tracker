@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -6,14 +7,14 @@ from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import async_playwright, Page, Response, Browser
+from playwright.async_api import async_playwright, Page, Response, Browser, BrowserContext
 
-CONCURRENCY = 16         # parallel browser contexts
-ROUTE_TIMEOUT_MS = 15_000  # 15s per route before giving up
+CONCURRENCY = 8          # lower while logged-in to reduce bot-detection risk
+ROUTE_TIMEOUT_MS = 20_000
 GO_WILD_BRANDS = {"go wild", "gowild", "wild"}
-FRONTIER_SEARCH = "https://www.flyfrontier.com/travel/book-a-flight/"
+FRONTIER_HOME = "https://booking.flyfrontier.com"
 
-# All airports Frontier serves as of 2025
+# All airports Frontier serves
 FRONTIER_AIRPORTS = [
     "ABQ", "ATL", "AUS", "BNA", "BOS", "BUF", "BWI", "CHS", "CLE", "CLT",
     "CMH", "CVG", "DAL", "DCA", "DEN", "DFW", "DTW", "EWR", "FLL", "GRR",
@@ -24,10 +25,8 @@ FRONTIER_AIRPORTS = [
     "STL", "SYR", "TPA", "TUL", "TUS", "TYS",
 ]
 
-# Hardcoded Frontier route pairs (both directions) used when live discovery fails.
-# Covers DEN hub-and-spoke + major point-to-point markets (~380 directional pairs).
 _HUB_SPOKES = [
-    # DEN is Frontier's main hub — connects to nearly every served city
+    # DEN hub
     ("DEN", "ABQ"), ("DEN", "ATL"), ("DEN", "AUS"), ("DEN", "BNA"), ("DEN", "BOS"),
     ("DEN", "BUF"), ("DEN", "BWI"), ("DEN", "CHS"), ("DEN", "CLE"), ("DEN", "CLT"),
     ("DEN", "CMH"), ("DEN", "CVG"), ("DEN", "DAL"), ("DEN", "DCA"), ("DEN", "DFW"),
@@ -45,42 +44,42 @@ _HUB_SPOKES = [
     ("ATL", "FLL"), ("ATL", "LAS"), ("ATL", "LAX"), ("ATL", "MCO"), ("ATL", "MDW"),
     ("ATL", "MIA"), ("ATL", "PHX"), ("ATL", "SJU"), ("ATL", "TPA"), ("ATL", "BOS"),
     ("ATL", "EWR"), ("ATL", "PHL"),
-    # Chicago MDW point-to-point
+    # Chicago MDW
     ("MDW", "FLL"), ("MDW", "LAS"), ("MDW", "MCO"), ("MDW", "MIA"), ("MDW", "PHX"),
     ("MDW", "TPA"), ("MDW", "SJU"), ("MDW", "MSY"), ("MDW", "PHL"),
-    # LAS point-to-point
+    # LAS
     ("LAS", "ATL"), ("LAS", "CLT"), ("LAS", "FLL"), ("LAS", "IAH"), ("LAS", "LAX"),
     ("LAS", "MCO"), ("LAS", "MIA"), ("LAS", "MSP"), ("LAS", "OAK"), ("LAS", "ORD"),
     ("LAS", "PHX"), ("LAS", "SAN"), ("LAS", "SFO"), ("LAS", "SJC"), ("LAS", "TPA"),
-    # MCO point-to-point
+    # MCO
     ("MCO", "BOS"), ("MCO", "BWI"), ("MCO", "CLT"), ("MCO", "EWR"), ("MCO", "FLL"),
     ("MCO", "IAD"), ("MCO", "LGA"), ("MCO", "MIA"), ("MCO", "PHL"), ("MCO", "PHX"),
     ("MCO", "MSP"), ("MCO", "SJU"),
-    # PHX point-to-point
+    # PHX
     ("PHX", "LAX"), ("PHX", "OAK"), ("PHX", "SAN"), ("PHX", "SFO"), ("PHX", "SJC"),
     ("PHX", "TPA"), ("PHX", "MSP"), ("PHX", "ORD"), ("PHX", "FLL"), ("PHX", "MIA"),
-    # FLL point-to-point
+    # FLL
     ("FLL", "BOS"), ("FLL", "BWI"), ("FLL", "CLE"), ("FLL", "CLT"), ("FLL", "EWR"),
     ("FLL", "IAD"), ("FLL", "LGA"), ("FLL", "MDW"), ("FLL", "MIA"), ("FLL", "PHL"),
-    # MIA point-to-point
+    # MIA
     ("MIA", "BOS"), ("MIA", "EWR"), ("MIA", "LGA"), ("MIA", "MDW"), ("MIA", "ORD"),
     ("MIA", "PHL"),
-    # SJU (San Juan) point-to-point
+    # SJU
     ("SJU", "BWI"), ("SJU", "CLT"), ("SJU", "EWR"), ("SJU", "FLL"), ("SJU", "IAD"),
     ("SJU", "MIA"), ("SJU", "ORD"), ("SJU", "PHL"),
-    # West Coast / Southwest
+    # West Coast
     ("LAX", "SFO"), ("LAX", "SJC"), ("LAX", "SEA"), ("LAX", "OAK"),
     ("SFO", "SEA"), ("SAN", "SEA"), ("OAK", "SEA"),
-    # Texas point-to-point
+    # Texas
     ("DAL", "LAS"), ("DAL", "MCO"), ("DAL", "MIA"), ("DAL", "PHX"),
     ("AUS", "LAS"), ("AUS", "MCO"), ("AUS", "PHX"),
     ("SAT", "LAS"), ("SAT", "MCO"),
     ("HOU", "LAS"), ("HOU", "MCO"), ("HOU", "MIA"),
-    # Southeast point-to-point
+    # Southeast
     ("TPA", "BOS"), ("TPA", "BWI"), ("TPA", "CLT"), ("TPA", "EWR"),
     ("TPA", "LGA"), ("TPA", "MDW"), ("TPA", "PHL"),
     ("MSY", "LAS"), ("MSY", "MCO"), ("MSY", "PHX"),
-    # Midwest point-to-point
+    # Midwest
     ("ORD", "FLL"), ("ORD", "LAS"), ("ORD", "MCO"), ("ORD", "MIA"), ("ORD", "PHX"),
     ("MSP", "FLL"), ("MSP", "MCO"), ("MSP", "PHX"), ("MSP", "TPA"),
     ("MCI", "LAS"), ("MCI", "MCO"), ("MCI", "PHX"),
@@ -91,11 +90,16 @@ _HUB_SPOKES = [
     ("BOS", "FLL"), ("BOS", "MCO"), ("BOS", "MIA"), ("BOS", "TPA"),
 ]
 
-# Expand both directions
 FRONTIER_KNOWN_ROUTES: set[tuple[str, str]] = set()
 for _o, _d in _HUB_SPOKES:
     FRONTIER_KNOWN_ROUTES.add((_o, _d))
     FRONTIER_KNOWN_ROUTES.add((_d, _o))
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 STEALTH_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
@@ -104,12 +108,6 @@ STEALTH_HEADERS = {
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"macOS"',
 }
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 
 @dataclass
@@ -161,22 +159,29 @@ def _extract_go_wild_flights(data: Any, route: dict, date: str) -> list[GoWildFl
             return
         if not isinstance(node, dict):
             return
-        has_price = any(k in node for k in ("price", "totalPrice", "amount", "fare"))
+        has_price = any(k in node for k in ("price", "totalPrice", "amount", "fare", "total"))
         has_context = any(k in node for k in (
             "flightNumber", "flight_number", "segments", "legs",
             "fareBrand", "fare_brand", "brandName", "fareFamily", "productName",
+            "fareType", "cabin", "productType",
         ))
         if has_price and has_context:
             brand = str(
                 node.get("fareBrand") or node.get("fare_brand") or
                 node.get("brandName") or node.get("fareFamily") or
-                node.get("productName") or ""
+                node.get("productName") or node.get("fareType") or
+                node.get("productType") or ""
             )
             if _is_go_wild(brand):
-                price = float(
+                raw_price = (
                     node.get("price") or node.get("totalPrice") or
-                    node.get("amount") or node.get("fare") or 0
+                    node.get("amount") or node.get("fare") or
+                    node.get("total") or 0
                 )
+                # price may be nested: {"amount": 0, "currency": "USD"}
+                if isinstance(raw_price, dict):
+                    raw_price = raw_price.get("amount", 0) or raw_price.get("value", 0)
+                price = float(raw_price)
                 if max_price is None or price <= max_price:
                     flights.append(GoWildFlight(
                         origin=route["origin"],
@@ -201,87 +206,156 @@ def _extract_go_wild_flights(data: Any, route: dict, date: str) -> list[GoWildFl
     return flights
 
 
-def _collect_airport_codes(node: Any, out: list[str]) -> None:
-    if isinstance(node, list):
-        for item in node:
-            _collect_airport_codes(item, out)
-    elif isinstance(node, dict):
-        for key, val in node.items():
-            if key.lower() in ("code", "iata", "airportcode", "stationcode", "id") and isinstance(val, str):
-                c = val.strip().upper()
-                if len(c) == 3 and c.isalpha():
-                    out.append(c)
-            else:
-                _collect_airport_codes(val, out)
-    elif isinstance(node, str):
-        c = node.strip().upper()
-        if len(c) == 3 and c.isalpha():
-            out.append(c)
-
-
-async def _new_context(browser: Browser):
-    return await browser.new_context(
+async def _new_context(browser: Browser, auth_state: dict | None = None) -> BrowserContext:
+    kwargs = dict(
         user_agent=USER_AGENT,
         extra_http_headers=STEALTH_HEADERS,
         viewport={"width": 1280, "height": 800},
     )
+    if auth_state:
+        kwargs["storage_state"] = auth_state
+    return await browser.new_context(**kwargs)
+
+
+def _is_frontier_url(url: str) -> bool:
+    return "flyfrontier" in url or "frontierairlines" in url
 
 
 # ---------------------------------------------------------------------------
-# Route discovery (parallel)
+# Login
 # ---------------------------------------------------------------------------
 
-async def _discover_origin(sem: asyncio.Semaphore, browser: Browser, origin: str) -> list[str]:
-    async with sem:
-        context = await _new_context(browser)
-        page = await context.new_page()
-        pending: list[Response] = []
+async def _login(browser: Browser, email: str, password: str) -> dict | None:
+    """Log in to Frontier and return the serialized auth state (cookies + storage)."""
+    context = await _new_context(browser)
+    page = await context.new_page()
+    auth_state = None
 
-        def on_response(r: Response) -> None:
-            ct = r.headers.get("content-type", "")
-            if r.status == 200 and "application/json" in ct:
-                url = r.url
-                if any(kw in url for kw in ("destination", "airport", "route", "station")):
-                    if "flyfrontier" in url or "frontierairlines" in url:
-                        pending.append(r)
+    try:
+        print("Logging in to Frontier…")
+        await page.goto(FRONTIER_HOME, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(3_000)
 
-        page.on("response", on_response)
-        found: list[str] = []
-        try:
-            url = FRONTIER_SEARCH + "?" + urlencode({"origin": origin, "tripType": "ONE_WAY"})
-            await page.goto(url, wait_until="networkidle", timeout=30_000)
-            await page.wait_for_timeout(1_500)
-            for r in pending:
+        # Find and click sign-in link
+        sign_in_selectors = [
+            'a:has-text("Sign In")',
+            'button:has-text("Sign In")',
+            'a:has-text("Log In")',
+            '[data-testid*="sign"]',
+            '[data-cy*="sign"]',
+            'a[href*="sign"]',
+            'a[href*="login"]',
+        ]
+        clicked = False
+        for sel in sign_in_selectors:
+            try:
+                elem = page.locator(sel).first
+                if await elem.is_visible(timeout=2_000):
+                    await elem.click()
+                    clicked = True
+                    print(f"  Clicked sign-in: {sel!r}")
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            print("  No sign-in button found on homepage — trying direct login URL…")
+            for login_url in [
+                f"{FRONTIER_HOME}/account/login",
+                f"{FRONTIER_HOME}/login",
+                f"{FRONTIER_HOME}/signIn",
+            ]:
                 try:
-                    data = await r.json()
-                    _collect_airport_codes(data, found)
+                    await page.goto(login_url, wait_until="domcontentloaded", timeout=15_000)
+                    if page.url == login_url or "login" in page.url or "sign" in page.url.lower():
+                        print(f"  At login URL: {page.url}")
+                        break
                 except Exception:
                     pass
+
+        await page.wait_for_timeout(2_000)
+
+        # Fill email
+        try:
+            email_input = page.locator(
+                'input[type="email"], input[name*="email" i], input[id*="email" i], input[placeholder*="email" i]'
+            ).first
+            await email_input.wait_for(state="visible", timeout=10_000)
+            await email_input.fill(email)
+            print("  Filled email.")
+        except Exception as e:
+            print(f"  Email field not found: {e}")
+            return None
+
+        await page.wait_for_timeout(500)
+
+        # Fill password
+        try:
+            pw_input = page.locator('input[type="password"]').first
+            await pw_input.wait_for(state="visible", timeout=5_000)
+            await pw_input.fill(password)
+            print("  Filled password.")
+        except Exception as e:
+            print(f"  Password field not found: {e}")
+            return None
+
+        await page.wait_for_timeout(500)
+
+        # Submit
+        submit_selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Sign In")',
+            'button:has-text("Log In")',
+            'button:has-text("Continue")',
+        ]
+        for sel in submit_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=2_000):
+                    await btn.click()
+                    print(f"  Clicked submit: {sel!r}")
+                    break
+            except Exception:
+                continue
+
+        # Wait for navigation after login
+        try:
+            await page.wait_for_url(
+                lambda url: "login" not in url.lower() and "sign" not in url.lower(),
+                timeout=15_000,
+            )
         except Exception:
             pass
-        finally:
-            await context.close()
-        return [d for d in found if d != origin and d in FRONTIER_AIRPORTS]
+        await page.wait_for_timeout(3_000)
+
+        final_url = page.url
+        print(f"  Login result URL: {final_url}")
+
+        if "login" in final_url.lower() or "sign" in final_url.lower():
+            print("  ⚠️  Still on login page — credentials may be wrong or bot-blocked.")
+            return None
+
+        auth_state = await context.storage_state()
+        print("  ✅ Login succeeded — auth state captured.")
+
+    except Exception as e:
+        print(f"  Login error: {type(e).__name__}: {e}")
+    finally:
+        await context.close()
+
+    return auth_state
 
 
-async def _discover_routes_async(browser: Browser) -> list[tuple[str, str]]:
-    print("Discovering Frontier routes (parallel)…")
-    sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [_discover_origin(sem, browser, o) for o in FRONTIER_AIRPORTS]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+# ---------------------------------------------------------------------------
+# Route discovery
+# ---------------------------------------------------------------------------
 
-    pairs: set[tuple[str, str]] = set()
-    for origin, result in zip(FRONTIER_AIRPORTS, results):
-        if isinstance(result, list):
-            for dest in result:
-                pairs.add((origin, dest))
-
-    if not pairs:
-        print("  API discovery yielded nothing — using hardcoded Frontier route list")
-        pairs = set(FRONTIER_KNOWN_ROUTES)
-
+async def _discover_routes_async(browser: Browser, auth_state: dict | None) -> list[tuple[str, str]]:
+    print("Using hardcoded Frontier route list…")
+    pairs = sorted(FRONTIER_KNOWN_ROUTES)
     print(f"  {len(pairs)} route pairs to check")
-    return sorted(pairs)
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -291,44 +365,61 @@ async def _discover_routes_async(browser: Browser) -> list[tuple[str, str]]:
 async def _check_route(
     sem: asyncio.Semaphore,
     browser: Browser,
+    auth_state: dict | None,
     route: dict,
     date: str,
+    search_url_template: list[str],  # mutable [url] so we can share the discovered URL
 ) -> list[GoWildFlight]:
     async with sem:
-        context = await _new_context(browser)
+        context = await _new_context(browser, auth_state)
         page = await context.new_page()
         pending: list[Response] = []
 
         def on_response(r: Response) -> None:
             ct = r.headers.get("content-type", "")
-            if r.status != 200 or "application/json" not in ct:
-                return
-            url = r.url
-            if (
-                ("flyfrontier" in url or "frontierairlines" in url)
-                and "/api/" in url
-                and any(kw in url for kw in ("flight", "avail", "search", "offer"))
-            ):
+            if r.status == 200 and "application/json" in ct and _is_frontier_url(r.url):
                 pending.append(r)
 
         page.on("response", on_response)
         captured: list[GoWildFlight] = []
         seen: set[str] = set()
 
+        origin = route["origin"]
+        dest = route["destination"]
+
         try:
+            # Build search URL
             params = urlencode({
-                "origin": route["origin"], "destination": route["destination"],
-                "departDate": date, "returnDate": "",
-                "adults": "1", "children": "0", "infants": "0",
+                "origin": origin,
+                "destination": dest,
+                "departDate": date,
+                "adults": "1",
+                "children": "0",
+                "infants": "0",
                 "tripType": "ONE_WAY",
             })
-            await page.goto(
-                f"{FRONTIER_SEARCH}?{params}",
-                wait_until="networkidle",
-                timeout=ROUTE_TIMEOUT_MS,
-            )
-            await page.wait_for_timeout(2_000)
 
+            # Use discovered URL template if available, else try known patterns
+            if search_url_template:
+                url = f"{search_url_template[0]}?{params}"
+            else:
+                url = f"{FRONTIER_HOME}/flight/search?{params}"
+
+            await page.goto(url, wait_until="networkidle", timeout=ROUTE_TIMEOUT_MS)
+            await page.wait_for_timeout(2_500)
+
+            # If page redirected to homepage (bot block), try form fill as fallback
+            if "booking.flyfrontier.com" in page.url and "/flight" not in page.url:
+                await _fill_search_form(page, origin, dest, date)
+                await page.wait_for_timeout(3_000)
+
+                # Record actual results URL for future requests
+                if "/flight" in page.url and not search_url_template:
+                    base = page.url.split("?")[0]
+                    search_url_template.append(base)
+                    print(f"  Discovered search URL: {base}")
+
+            # Process captured JSON responses
             for r in pending:
                 try:
                     data = await r.json()
@@ -339,24 +430,28 @@ async def _check_route(
                 except Exception:
                     pass
 
-            # DOM fallback
+            # DOM fallback — scan visible fare cards
             try:
-                cards = await page.locator('[data-testid*="flight"], .flight-card, .fare-cell').all()
-                for card in cards:
-                    text = await card.text_content() or ""
-                    if not any(b in text.lower() for b in GO_WILD_BRANDS):
-                        continue
-                    pm = re.search(r"\$(\d+(?:\.\d+)?)", text)
-                    price = float(pm.group(1)) if pm else 0.0
-                    mp = route.get("maxPrice")
-                    if mp is not None and price > mp:
-                        continue
-                    fn_m = re.search(r"F9\s*(\d+)", text, re.IGNORECASE)
-                    fn = f"F9{fn_m.group(1)}" if fn_m else "UNK"
-                    tm = re.search(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, re.IGNORECASE)
-                    dep = tm.group(0) if tm else ""
-                    if fn != "UNK" or dep:
-                        f = GoWildFlight(route["origin"], route["destination"], date, dep, fn, price, "USD", "Go Wild")
+                body_text = await page.evaluate("document.body.innerText")
+                if any(b in body_text.lower() for b in GO_WILD_BRANDS):
+                    cards = await page.locator(
+                        '[data-testid*="flight"], .flight-card, .fare-cell, '
+                        '[class*="fare"], [class*="flight"]'
+                    ).all()
+                    for card in cards:
+                        text = await card.text_content() or ""
+                        if not any(b in text.lower() for b in GO_WILD_BRANDS):
+                            continue
+                        pm = re.search(r"\$(\d+(?:\.\d+)?)", text)
+                        price = float(pm.group(1)) if pm else 0.0
+                        mp = route.get("maxPrice")
+                        if mp is not None and price > mp:
+                            continue
+                        fn_m = re.search(r"F9\s*(\d+)", text, re.IGNORECASE)
+                        fn = f"F9{fn_m.group(1)}" if fn_m else "UNK"
+                        tm = re.search(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, re.IGNORECASE)
+                        dep = tm.group(0) if tm else ""
+                        f = GoWildFlight(origin, dest, date, dep, fn, price, "USD", "Go Wild")
                         if f.key() not in seen:
                             seen.add(f.key())
                             captured.append(f)
@@ -364,12 +459,84 @@ async def _check_route(
                 pass
 
         except Exception as e:
-            o, d = route["origin"], route["destination"]
-            print(f"    Timeout/error {o}→{d} {date}: {type(e).__name__}")
+            print(f"    Error {origin}→{dest} {date}: {type(e).__name__}")
         finally:
             await context.close()
 
         return captured
+
+
+async def _fill_search_form(page: Page, origin: str, dest: str, date: str) -> None:
+    """Try to fill the booking search form directly."""
+    # One-way toggle
+    for sel in ['label:has-text("One-way")', 'input[value*="ONE_WAY"]', '#oneWay', '[data-testid*="oneway"]']:
+        try:
+            e = page.locator(sel).first
+            if await e.is_visible(timeout=1_000):
+                await e.click()
+                break
+        except Exception:
+            pass
+
+    # Origin field
+    for sel in ['input[name*="origin" i]', 'input[id*="from" i]', 'input[placeholder*="from" i]', '#Origin']:
+        try:
+            e = page.locator(sel).first
+            if await e.is_visible(timeout=1_000):
+                await e.triple_click()
+                await e.type(origin, delay=80)
+                await page.wait_for_timeout(1_000)
+                for suggestion in [f'li:has-text("{origin}")', f'[data-iata="{origin}"]', f'[data-code="{origin}"]']:
+                    try:
+                        s = page.locator(suggestion).first
+                        if await s.is_visible(timeout=1_000):
+                            await s.click()
+                            break
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
+
+    # Destination field
+    for sel in ['input[name*="dest" i]', 'input[id*="to" i]', 'input[placeholder*="to" i]', '#Destination']:
+        try:
+            e = page.locator(sel).first
+            if await e.is_visible(timeout=1_000):
+                await e.triple_click()
+                await e.type(dest, delay=80)
+                await page.wait_for_timeout(1_000)
+                for suggestion in [f'li:has-text("{dest}")', f'[data-iata="{dest}"]', f'[data-code="{dest}"]']:
+                    try:
+                        s = page.locator(suggestion).first
+                        if await s.is_visible(timeout=1_000):
+                            await s.click()
+                            break
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
+
+    # Date field
+    for sel in ['input[name*="depart" i]', 'input[type="date"]', 'input[id*="date" i]', '#DepartDate']:
+        try:
+            e = page.locator(sel).first
+            if await e.is_visible(timeout=1_000):
+                await e.fill(date)
+                break
+        except Exception:
+            pass
+
+    # Submit
+    for sel in ['button[type="submit"]', 'input[value="SEARCH"]', 'button:has-text("Search")', 'button:has-text("SEARCH")']:
+        try:
+            e = page.locator(sel).first
+            if await e.is_visible(timeout=1_000):
+                await e.click()
+                break
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -377,15 +544,28 @@ async def _check_route(
 # ---------------------------------------------------------------------------
 
 async def _run(config: dict, timezone: str) -> list[GoWildFlight]:
-    all_routes_mode = config.get("all_routes", False)
-    days_ahead = config.get("days_ahead", 3 if all_routes_mode else 14)
+    days_ahead = config.get("days_ahead", 7)
     dates = _date_range(days_ahead, timezone)
+
+    email = config.get("frontier_email") or os.environ.get("FRONTIER_EMAIL", "")
+    password = config.get("frontier_password") or os.environ.get("FRONTIER_PASSWORD", "")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
+            # Log in once and share auth state across all checks
+            auth_state = None
+            if email and password:
+                auth_state = await _login(browser, email, password)
+                if auth_state is None:
+                    print("  Login failed — continuing without authentication (Go Wild fares may not appear)")
+            else:
+                print("  No Frontier credentials configured — searching without login")
+
+            # Route discovery
+            all_routes_mode = config.get("all_routes", False)
             if all_routes_mode:
-                pairs = await _discover_routes_async(browser)
+                pairs = await _discover_routes_async(browser, auth_state)
                 routes_to_check = [
                     {"origin": o, "destination": d, "maxPrice": config.get("maxPrice")}
                     for o, d in pairs
@@ -397,8 +577,10 @@ async def _run(config: dict, timezone: str) -> list[GoWildFlight]:
             print(f"Checking {len(routes_to_check)} route(s) × {len(dates)} date(s) = {total} searches ({CONCURRENCY} parallel)")
 
             sem = asyncio.Semaphore(CONCURRENCY)
+            search_url_template: list[str] = []  # shared mutable to record discovered URL
+
             tasks = [
-                _check_route(sem, browser, route, date)
+                _check_route(sem, browser, auth_state, route, date, search_url_template)
                 for route in routes_to_check
                 for date in (
                     dates if all_routes_mode or route.get("dates") == "flexible"
@@ -413,7 +595,7 @@ async def _run(config: dict, timezone: str) -> list[GoWildFlight]:
                 all_results.extend(flights)
                 done += 1
                 if done % 50 == 0:
-                    print(f"  Progress: {done}/{len(tasks)} searches complete, {len(all_results)} Go Wild flight(s) found so far")
+                    print(f"  Progress: {done}/{len(tasks)} done, {len(all_results)} Go Wild flight(s) found so far")
 
         finally:
             await browser.close()

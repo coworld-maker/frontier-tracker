@@ -35,6 +35,9 @@ jobs:
         run: echo '${{ secrets.CONFIG_JSON }}' > config.json
 
       - name: Run tracker
+        env:
+          FRONTIER_EMAIL: ${{ secrets.FRONTIER_EMAIL }}
+          FRONTIER_PASSWORD: ${{ secrets.FRONTIER_PASSWORD }}
         run: python main.py
 
       - name: Commit updated state
