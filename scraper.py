@@ -223,6 +223,58 @@ def _is_frontier_url(url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Saved session (preferred — avoids 2FA entirely)
+# ---------------------------------------------------------------------------
+
+def _load_saved_auth_state() -> dict | None:
+    """Load a previously captured session from FRONTIER_AUTH_STATE env var
+    (GitHub Secret) or a local auth_state.json file."""
+    import json
+
+    raw = os.environ.get("FRONTIER_AUTH_STATE", "").strip()
+    source = "FRONTIER_AUTH_STATE secret"
+    if not raw:
+        try:
+            with open("auth_state.json") as f:
+                raw = f.read()
+            source = "auth_state.json"
+        except FileNotFoundError:
+            return None
+
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️  Could not parse saved session from {source}: {e}")
+        return None
+
+    print(f"  Loaded saved Frontier session from {source} "
+          f"({len(state.get('cookies', []))} cookies).")
+    return state
+
+
+async def _validate_auth_state(browser: Browser, auth_state: dict) -> dict | None:
+    """Open the booking site with the saved session and confirm it's still
+    logged in. Returns the state if valid, else None."""
+    context = await _new_context(browser, auth_state)
+    page = await context.new_page()
+    try:
+        await page.goto(FRONTIER_HOME, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(4_000)
+        body = (await page.evaluate("document.body.innerText")).lower()
+        if any(s in body for s in ("sign out", "log out", "logout", "my account", "miles")):
+            print("  ✅ Saved session is still valid.")
+            return auth_state
+        print("  ⚠️  Saved session appears EXPIRED — run save_session.py locally "
+              "and update the FRONTIER_AUTH_STATE secret.")
+        return None
+    except Exception as e:
+        print(f"  Session validation error: {type(e).__name__}: {e} — using it anyway.")
+        return auth_state
+    finally:
+        await context.close()
+
+
+# ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
 
@@ -610,14 +662,18 @@ async def _run(config: dict, timezone: str) -> list[GoWildFlight]:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
-            # Log in once and share auth state across all checks
-            auth_state = None
-            if email and password:
+            # Auth priority: saved session (FRONTIER_AUTH_STATE or auth_state.json)
+            # > interactive login > anonymous
+            auth_state = _load_saved_auth_state()
+            if auth_state:
+                auth_state = await _validate_auth_state(browser, auth_state)
+
+            if auth_state is None and email and password:
                 auth_state = await _login(browser, email, password)
                 if auth_state is None:
                     print("  Login failed — continuing without authentication (Go Wild fares may not appear)")
-            else:
-                print("  No Frontier credentials configured — searching without login")
+            elif auth_state is None:
+                print("  No Frontier session or credentials configured — searching without login")
 
             # Route discovery
             all_routes_mode = config.get("all_routes", False)
