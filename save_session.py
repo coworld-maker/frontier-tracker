@@ -25,11 +25,21 @@ MAX_WAIT_MINUTES = 10
 
 async def main():
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            extra_http_headers=STEALTH_HEADERS,
-            viewport={"width": 1280, "height": 800},
+        launch_kwargs = dict(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        # Prefer the real installed Chrome — much less likely to trip bot detection
+        try:
+            browser = await pw.chromium.launch(channel="chrome", **launch_kwargs)
+            print("Using your installed Google Chrome.")
+        except Exception:
+            browser = await pw.chromium.launch(**launch_kwargs)
+            print("Google Chrome not found — using bundled Chromium.")
+
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = await context.new_page()
         await page.goto(FRONTIER_HOME, wait_until="domcontentloaded")
