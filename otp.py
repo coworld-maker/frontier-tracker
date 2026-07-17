@@ -4,6 +4,8 @@ Fetch a Frontier login verification code from Gmail via IMAP.
 Requires a Gmail *app password* (https://myaccount.google.com/apppasswords),
 NOT the regular Google account password.
 """
+from __future__ import annotations
+
 import email as email_lib
 import imaplib
 import re
