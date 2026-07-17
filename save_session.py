@@ -39,24 +39,9 @@ async def main():
         print("  1. Click Sign In / Log In")
         print("  2. Enter email + password")
         print("  3. Enter the verification code from your email")
-        print(f"Waiting up to {MAX_WAIT_MINUTES} minutes for login…")
+        print("  4. Wait until you can see you're logged in (your name/account)")
         print("=" * 60)
-
-        logged_in = False
-        for _ in range(MAX_WAIT_MINUTES * 12):  # poll every 5s
-            await asyncio.sleep(5)
-            try:
-                body = await page.evaluate("document.body.innerText")
-                low = body.lower()
-                if any(s in low for s in ("my account", "sign out", "log out", "logout", "miles")):
-                    logged_in = True
-                    break
-            except Exception:
-                pass
-
-        if not logged_in:
-            print("\n⚠️  Never detected a logged-in state. If you DID log in successfully,")
-            print("    the session will still be saved — check the file works in Actions.")
+        await asyncio.to_thread(input, "\n>>> When you are FULLY logged in, come back here and press Enter... ")
 
         state = await context.storage_state()
         with open("auth_state.json", "w") as f:
