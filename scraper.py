@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -318,6 +319,62 @@ async def _login(browser: Browser, email: str, password: str) -> dict | None:
                     break
             except Exception:
                 continue
+
+        submit_time = time.time()
+        await page.wait_for_timeout(4_000)
+
+        # --- 2FA: Frontier emails a verification code on every login ---
+        otp_input = None
+        otp_selectors = [
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i]',
+            'input[id*="code" i]',
+            'input[name*="otp" i]',
+            'input[id*="otp" i]',
+            'input[placeholder*="code" i]',
+        ]
+        for sel in otp_selectors:
+            try:
+                e = page.locator(sel).first
+                if await e.is_visible(timeout=2_000):
+                    otp_input = e
+                    print(f"  2FA code screen detected ({sel!r}).")
+                    break
+            except Exception:
+                continue
+
+        if otp_input is not None:
+            gmail_user = os.environ.get("GMAIL_EMAIL", email)
+            gmail_app_pw = os.environ.get("GMAIL_APP_PASSWORD", "")
+            if not gmail_app_pw:
+                print("  ⚠️  2FA required but GMAIL_APP_PASSWORD is not set — cannot proceed.")
+                return None
+
+            from otp import fetch_frontier_otp
+            print("  Polling Gmail for the verification code…")
+            code = await asyncio.to_thread(
+                fetch_frontier_otp, gmail_user, gmail_app_pw, submit_time
+            )
+            if not code:
+                print("  ⚠️  No OTP email arrived — login failed.")
+                return None
+
+            await otp_input.fill(code)
+            print(f"  Entered code.")
+            await page.wait_for_timeout(500)
+            for sel in [
+                'button[type="submit"]',
+                'button:has-text("Verify")',
+                'button:has-text("Continue")',
+                'button:has-text("Submit")',
+            ]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=2_000):
+                        await btn.click()
+                        break
+                except Exception:
+                    continue
 
         # Wait for navigation after login
         try:

@@ -38,6 +38,8 @@ jobs:
         env:
           FRONTIER_EMAIL: ${{ secrets.FRONTIER_EMAIL }}
           FRONTIER_PASSWORD: ${{ secrets.FRONTIER_PASSWORD }}
+          GMAIL_EMAIL: ${{ secrets.GMAIL_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python main.py
 
       - name: Commit updated state
